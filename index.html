@@ -386,7 +386,7 @@ async function pdfToUnits(arrayBuffer) {
     let text = "", lastY = null;
     for (const it of content.items) {
       const y = it.transform ? it.transform[5] : null;
-      if (lastY !== null && y !== null && Math.abs(y - lastY) > 2) text += "\n";
+      if (lastY !== null && y !== null && Math.abs(y - lastY) > 2 && !text.endsWith("\n")) text += "\n";
       text += it.str; if (it.hasEOL) text += "\n";
       lastY = y;
     }
@@ -401,9 +401,26 @@ function isHeading(line) {
   if (!t || t.length > 90) return false;
   if (/^#{1,6}\s+\S/.test(t)) return true;                                   // markdown heading
   if (/^(section|chapter|part|article|unit|week)\s+[\w.]+/i.test(t) && !/[.!?]$/.test(t)) return true;
-  if (/^\d+(\.\d+)*[.)]?\s+[A-Z][^.!?]*$/.test(t) && t.split(" ").length <= 10) return true; // "6. Late Work Policy"
+  if (/^\d+(\.\d+)*[.)]?\s+[A-Z][^.!?]*$/.test(t) && t.split(" ").length <= 10 && titleCase(t.replace(/^[\d.)]+\s+/, ""))) return true; // "6. Late Work Policy" (not "1. Describe the major…")
   if (t === t.toUpperCase() && /[A-Z]{3}/.test(t) && t.split(" ").length <= 10) return true;   // ALL CAPS
-  return false;
+  return plainTitle(t);
+}
+function plainTitle(t) {        // "Learning Outcomes", "Course Description"
+  return /^[A-Z]/.test(t) && !/[.!?,;]$/.test(t) && t.length <= 60 && t.replace(/:$/, "").split(/\s+/).length <= 7 && titleCase(t.replace(/:$/, ""));
+}
+// a plain Title Case line only counts as a heading if the line before it finished (not a wrapped PDF line)
+function headingAfter(line, prev) {
+  if (!isHeading(line)) return false;
+  const t = line.trim(), p = (prev || "").trim();
+  const strong = /^#{1,6}\s/.test(t) || /^(section|chapter|part|article|unit|week)\s/i.test(t) || /^\d/.test(t) || (t === t.toUpperCase() && /[A-Z]{3}/.test(t));
+  return strong || !p || /[.!?:;)"”]$/.test(p) || isHeading(p) || /^([-*•]|\d+[.)])\s+/.test(p) || p.length < 60;
+}
+const SMALL_WORDS = new Set("a an and as at but by for from in into of on or the to vs with & -".split(" "));
+function titleCase(t) {          // every important word starts with a capital (or is a number)
+  const words = t.split(/\s+/).filter(Boolean);
+  if (!words.length || /^(dr|mr|ms|mrs|prof)\.?$/i.test(words[0])) return false;
+  if (/\b(is|are|was|were|will|must|may|can|should|has|have)\b/.test(t)) return false;   // a sentence, not a title
+  return words.every((w, i) => /^[A-Z0-9(“"'&\/-]/.test(w) || (i > 0 && SMALL_WORDS.has(w.toLowerCase())));
 }
 function chunkDocument(name, units, maxChars = 900) {
   const chunks = [];
@@ -416,9 +433,11 @@ function chunkDocument(name, units, maxChars = 900) {
       if (text.length > 20) chunks.push({ doc: name, page: u.page, section: bufHeading, text });
       buf = []; bufLen = 0;
     };
+    let prevLine = "";
     for (const raw of lines) {
       const line = raw.trimEnd();
-      if (isHeading(line)) {                 // a new section starts a new chunk
+      const wasPrev = prevLine; if (line.trim()) prevLine = line;
+      if (headingAfter(line, wasPrev)) {     // a new section starts a new chunk
         flush();
         heading = line.replace(/^#+\s*/, "").trim(); bufHeading = heading;
         continue;
@@ -432,7 +451,7 @@ function chunkDocument(name, units, maxChars = 900) {
 }
 
 /* ---------------- Step 1b: BM25 retrieval ---------------- */
-const STOP = new Set("a an the and or but if of to in on at for from by with about as is are was were be been being do does did i me my we our you your he she it its they them their this that these those what which who whom when where why how can could would should will shall may might must not no yes so than then there here have has had any all some get got also into over under up down out just".split(" "));
+const STOP = new Set("a an the and or but if of to in on at for from by with about as am im is are was were be been being do does did i me my we our you your he she it its they them their this that these those what which who whom when where why how can could would should will shall may might must not no yes so than then there here have has had any all some get got also into over under up down out just".split(" "));
 function stem(w) {                       // light stemmer: days→day, rules→rule, returned→return, submitted→submit
   if (w.length <= 3) return w;
   if (w.length > 4 && /ies$/.test(w)) return w.slice(0, -3) + "y";
@@ -488,7 +507,9 @@ const SYNONYMS = [
   ["due", "deadline", "date"],
   ["submit", "deliverable", "turn", "hand", "upload"],
   ["grade", "grading", "rubric", "score", "points", "mark", "percent", "worth", "weight"],
-  ["late", "overdue", "delay", "extension"],
+  ["late", "overdue", "delay", "extension", "tardy"],
+  ["class", "lecture", "session", "course", "meeting"],
+  ["calculate", "compute", "determine", "based", "breakdown", "weighted", "weight", "made", "count", "figure"],
   ["hours", "open", "close", "closed", "time", "schedule"],
   ["rule", "policy", "requirement", "allowed", "permitted"],
   ["cancel", "cancellation", "refund", "return"],
@@ -555,10 +576,32 @@ const TYPE_WORDS = {
   count: ["many", "number", "count"],
   where: ["where", "location", "place", "room"],
 };
+// PDFs (and some pasted text) break a sentence across several visual lines.
+// Glue a line onto the one before it unless the previous line clearly ended
+// (., !, ?, :) or this line starts a new bullet, number or heading.
+function reflowLines(text) {
+  const lines = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line) { lines.push(""); continue; }
+    let prev = lines.length ? lines[lines.length - 1] : "";
+    // a blank gap in the middle of a sentence (common in PDFs) isn't a real paragraph break
+    if (prev === "" && lines.length > 1) {
+      const before = lines[lines.length - 2];
+      if (!/[.!?:;]["”)]?$/.test(before) && !isHeading(before) && !/^([-*•]|\d+[.)])\s+/.test(before) && (/^[a-z(]/.test(line) || before.length >= 60)) { lines.pop(); prev = before; }
+    }
+    const startsNew = /^([-*•]|\d+[.)])\s+/.test(line) || headingAfter(line, prev);
+    const prevItem = /^([-*•]|\d+[.)])\s+/.test(prev);
+    const wrapped = /^[a-z(]/.test(line) || prev.length >= 60;      // wrapped lines are long, or carry on in lowercase
+    if (prev && !/[.!?:;]["”)]?$/.test(prev) && !isHeading(prev) && !startsNew && !prevItem && wrapped) {
+      lines[lines.length - 1] = (prev.endsWith("-") && /^[a-z]/.test(line)) ? prev.slice(0, -1) + line : prev + " " + line;
+    } else lines.push(line);
+  }
+  return lines.filter(Boolean);
+}
 function splitSentences(passage, rank) {
   const out = [];
-  for (const rawLine of passage.text.split("\n")) {
-    const line = rawLine.trim(); if (!line) continue;
+  for (const line of reflowLines(passage.text)) {
     const isItem = /^([-*•]|\d+[.)])\s+/.test(line);
     const parts = isItem ? [line] : line.split(/(?<!\b(?:Dr|Mr|Ms|Mrs|Prof|St|Jr|Sr|vs|etc|No|Inc|Co|Rm|Ave|Dept|Gov|Univ|e\.g|i\.e|U\.S)\.)(?<=[.!?])\s+(?=[A-Z0-9"“($])/);
     for (const p of parts) {
@@ -580,6 +623,17 @@ const UNIT = "(day|week|hour|month|year|absence|time|class|session|minute|book|i
 function toNum(s) { s = String(s).toLowerCase(); return NUM_WORDS[s] ?? parseFloat(s); }
 function fmtMoney(n) { return "$" + (Number.isInteger(n) ? n : n.toFixed(2)); }
 
+// "attendance", "grading policy", "late work": a few keywords, no question words. The section named that is the answer.
+function keywordQuery(q) {
+  const w = q.trim().replace(/[?.!]+$/, "").split(/\s+/);
+  return w.length <= 4 && !/^(what|when|where|who|why|how|can|could|do|does|did|is|are|will|should|may|if|i|my)\b/i.test(q.trim());
+}
+function headingFit(p, terms) {          // how much of the keywords (weighted by rarity) the section heading names
+  const h = new Set(tokenize(p.section || ""));
+  let total = 0, got = 0;
+  for (const t of terms) { const w = Math.min(idf(t), 4) + 0.1; total += w; if (h.has(t) || [...(SYN_MAP.get(t) || [])].some(x => h.has(x))) got += w; }
+  return total ? got / total : 0;
+}
 function scoreSentence(s, ctx) {
   const toks = new Set(tokenize(s.text));
   let score = 0, matched = [];
@@ -591,7 +645,7 @@ function scoreSentence(s, ctx) {
   const mainTerms = [...ctx.userTerms].filter(([, w]) => w >= 1).map(([t]) => t);
   const headingNamesTopic = mainTerms.length > 0 && mainTerms.every(t => heading.has(t) || [...(SYN_MAP.get(t) || [])].some(x => heading.has(x)));
   if (matched.length || shortSection || headingNamesTopic) // long sections: only sentences that match, unless the heading is the topic
-    for (const [t, w] of ctx.terms) if (heading.has(t) && !toks.has(t)) { score += 0.6 * idf(t) * w; matched.push(t); }
+    for (const [t, w] of ctx.terms) if (heading.has(t) && !toks.has(t)) { score += (keywordQuery(ctx.question) && headingNamesTopic && !tokenize(p.text).includes(t) ? 1.1 : 0.6) * idf(t) * w; matched.push(t); }
   if (score > 0 && TYPE_PATTERNS[ctx.type]?.test(s.text)) score *= 1.35;   // has the kind of info asked for
   if (score > 0) {
     // reward sentences that cover more of the question's separate ideas (word or synonym)
@@ -601,10 +655,16 @@ function scoreSentence(s, ctx) {
     const nums = ctx.question.match(/\b\d+(\.\d+)?\b/g) || [];
     if (nums.some(n => new RegExp(`\\b${n.replace(".", "\\.")}\\b`).test(s.text))) score *= 1.25;   // same exact number
   }
+  if (score > 0 && keywordQuery(ctx.question)) {                       // keyword search: the section whose heading names it wins
+    const fits = ctx._headFit || (ctx._headFit = ctx.passages.map(pp => headingFit(pp, mainTerms)));
+    const best = Math.max(...fits);
+    if (best >= 0.5) score *= fits[s.passage] === best ? 1.6 : 0.4;
+  }
   score *= 1 - 0.07 * s.passage;                                         // prefer higher-ranked passages
   return { ...s, score, matched };
 }
 // How much of the question's important meaning is covered by the chosen sentences (0..1)
+const GENERIC_TOPIC = new Set("policy policies rule rules guideline guidelines requirement requirements info information detail details overview section part".split(" ").map(stem));
 function coverage(ctx, chosen) {
   const got = new Set(chosen.flatMap(s => s.matched));
   let total = 0, have = 0;
@@ -612,6 +672,7 @@ function coverage(ctx, chosen) {
   const typeShown = chosen.some(s => TYPE_PATTERNS[ctx.type]?.test(s.text));
   for (const [t, w] of ctx.userTerms) {
     if (w < 1) continue;                                   // judge on the user's own words
+    if (GENERIC_TOPIC.has(t) && chosen.length) continue;   // "AI policy", "late rules": the topic word carries the meaning
     const syn = [...(SYN_MAP.get(t) || [])];
     const inCorpus = index.df.has(t) || syn.some(x => index.df.has(x));
     const weight = Math.min(idf(t), 4) * (inCorpus ? 1 : 2); // a topic that's nowhere in your files matters a lot
@@ -690,9 +751,10 @@ function generateAnswer(ctx) {
   const scored = ctx.sentences.map(s => scoreSentence(s, ctx)).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
   if (!scored.length) return { answer: NOT_FOUND(), chosen: [], cov: 0 };
   const best = scored[0].score, home = scored[0].passage, chosen = [];
+  const sectionAsked = keywordQuery(ctx.question) && headingFit(ctx.passages[home], [...ctx.userTerms].filter(([, w]) => w >= 1).map(([t]) => t)) >= 0.5;   // "early alert" → the whole Early Alert section
   for (const s of scored) {
     if (chosen.length >= MAX_SENTENCES) break;
-    const needed = s.passage === home ? 0.5 : 0.8;          // stay with the best source unless another is just as good
+    const needed = s.passage === home ? (sectionAsked ? 0.2 : 0.5) : 0.8;   // stay with the best source unless another is just as good
     if (s.score >= best * needed && !chosen.some(c => c.text === s.text)) chosen.push(s);
   }
   // the question names a short section by its heading → answer with that whole section
@@ -740,7 +802,8 @@ function generateAnswer(ctx) {
   function rankOf(p) { return -Math.max(...chosen.filter(c => c.passage === p).map(c => c.score)); }   // best-matching source first
   for (const s of ordered) {
     const isIntro = /:\s*$/.test(s.text);
-    facts.push({ text: boldNumbers(rewriteSentence(s.text)), cite: cite(s), intro: isIntro });
+    const asItem = s.item && !isIntro && ordered.filter(x => x.item && x.passage === s.passage).length >= 2;   // bullets stay bullets
+    facts.push({ text: boldNumbers(rewriteSentence(s.text)).replace(asItem ? /\.$/ : /$^/, ""), cite: cite(s), intro: isIntro, item: asItem });
     if (isIntro) {                                           // e.g. "Each student must submit:" → add the list
       const items = [];
       for (let k = s.idx + 1; k < ctx.sentences.length && items.length < 8; k++) {
@@ -751,7 +814,8 @@ function generateAnswer(ctx) {
       const main = [...ctx.userTerms].filter(([, w]) => w >= 1).map(([t]) => t);
       const mentions = it => { const tk = new Set(tokenize(it.text)); return main.filter(t => tk.has(t)).length; };
       const top = Math.max(0, ...items.map(mentions));
-      const show = ctx.focusItems ? items.filter(it => ctx.focusItems.has(it.idx)) : top > 0 && items.some(it => mentions(it) < top) ? items.filter(it => mentions(it) === top) : items;
+      const wholeSection = headingFit(ctx.passages[s.passage], main) >= 0.5;   // asked about the section itself → show the whole list
+      const show = ctx.focusItems ? items.filter(it => ctx.focusItems.has(it.idx)) : !wholeSection && top > 0 && items.some(it => mentions(it) < top) ? items.filter(it => mentions(it) === top) : items;
       for (const it of (show.length ? show : items)) {
         facts.push({ text: boldNumbers(rewriteSentence(it.text)).replace(/\.$/, ""), item: true });
         chosen.some(c => c.idx === it.idx) || chosen.push({ ...it, score: 0, matched: [] });
@@ -797,7 +861,8 @@ function isCommonWord(w) {
 function lowerFirst(t) {
   const m = t.match(/^(["“(]?)([A-Za-z][\w'-]*)/); if (!m) return t;
   if (!/^(a|an|the)$/i.test(m[2]) && /^\s+[A-Z][a-z]/.test(t.slice(m[0].length)) && !/^\s+(I|AI)\b/.test(t.slice(m[0].length))) return t;   // keep "Technical Implementation"
-  return isCommonWord(m[2]) ? m[1] + m[2][0].toLowerCase() + m[2].slice(1) + t.slice(m[0].length) : t;
+  const plainWord = /^[A-Z][a-z]+(ing|ed|ly|ion|ment)$/.test(m[2]) && /^\s+[a-z]/.test(t.slice(m[0].length));   // "Arriving more…" → "arriving more…"
+  return isCommonWord(m[2]) || plainWord ? m[1] + m[2][0].toLowerCase() + m[2].slice(1) + t.slice(m[0].length) : t;
 }
 function upperFirst(t) { return t.replace(/^(["“(]?)([a-z])/, (m, q, c) => q + c.toUpperCase()); }
 function boldNumbers(t) {
@@ -841,6 +906,7 @@ function rewriteSentence(raw) {
       t = `${subj} ${/s$/i.test(head) && !/ss$/i.test(head) ? "are" : "is"} ${lowerFirst(rest)}`;
     }
   }
+  t = t.replace(/\b(?:the )?students (will|should) be able to\b/gi, "you $1 be able to").replace(/\bimprove their own\b/gi, "improve your own");
   t = t.replace(/\bthe student's\b/gi, "your").replace(/\bstudents'\b/gi, "your").replace(/\byour own\b/g, "your own");
   t = upperFirst(t.trim().replace(/\s*[,;]\s*(?:or|and)?$/i, ""));    // list items: drop the trailing ", or"
   if (!/[.!?:”"]$/.test(t)) t += ".";
